@@ -9,7 +9,7 @@ import * as iss from "./core/issue.js";
 import { render, renderInline, esc } from "./core/render.js";
 import { iso, hhmm } from "./core/time.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const OPS = { addLog: ops.addLog, addAction: ops.addAction, tick: ops.tick, update: ops.update,
   create: ops.create, journalAdd: ops.journalAdd, registerPhone: ops.registerPhone };
 const SYNC_EVERY = 10 * 60 * 1000;
@@ -34,6 +34,7 @@ let cache = null;
 let syncing = null;
 let lastSync = load("p:lastSync", null);
 let syncState = "idle";                   // idle | busy | offline | error
+let syncError = "";
 
 // ---------------------------------------------------------------- store
 
@@ -68,11 +69,14 @@ async function sync({ quiet = false } = {}) {
       const changed = await store.pull();
       if (changed) { saveState(); reapplyQueue(); }
       lastSync = Date.now(); keep("p:lastSync", lastSync);
+      syncError = "";
       setSync(queue.length ? "offline" : "idle");
       if (changed || !quiet) route();
     } catch (e) {
+      syncError = explain(e);
       if (e.offline) setSync("offline");
-      else { setSync("error"); if (!quiet) toast(e.message, true); }
+      else { setSync("error"); if (!quiet) toast(syncError, true); }
+      if (!store.head) route();
     } finally {
       syncing = null;
     }
@@ -192,12 +196,25 @@ function statusPill(i) {
   return `<span class="pill st-${esc(i.status)}">${esc(i.status)}</span>`;
 }
 
+/** Plain words for the errors a first sync usually hits. */
+function explain(e) {
+  if (e.offline) return "Can't reach GitHub — check the connection.";
+  if (e.status === 401) return "GitHub rejected the token (expired, deleted or mistyped). Paste a new one in Settings.";
+  if (e.status === 403 || e.status === 404) return `The token can't see ${settings.owner}/${settings.repo}. ` +
+    "Give it access to that repository with Contents: Read and write, or check Owner and Repo in Settings.";
+  return e.message;
+}
+
 function needStore(view) {
   if (store && store.head) return true;
   view.innerHTML = store
-    ? `<p class="empty">Loading the tracker…</p>`
+    ? (syncError
+      ? `<div class="card"><h2>Couldn't load the tracker</h2><p>${esc(syncError)}</p>` +
+        `<div class="btns"><button class="btn" id="retry">Try again</button><a class="btn ghost" href="#settings">Settings</a></div></div>`
+      : `<p class="empty">Loading the tracker…</p>`)
     : `<div class="card"><h2>Welcome</h2><p>Connect this phone to <b>${esc(settings.owner)}/${esc(settings.repo)}</b> in Settings to start.</p>` +
       `<a class="btn" href="#settings">Open Settings</a></div>`;
+  $("#retry")?.addEventListener("click", () => { syncError = ""; route(); sync(); });
   return false;
 }
 
