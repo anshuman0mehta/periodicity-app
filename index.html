@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Periodicity">
+<meta name="theme-color" content="#020221">
+<meta name="referrer" content="no-referrer">
+<title>Periodicity</title>
+<script>
+  // dark by default, as on the desktop; applied before first paint
+  try { const t = JSON.parse(localStorage.getItem("p:settings") || "{}").theme || "dark";
+    if (t !== "auto") document.documentElement.dataset.theme = t; } catch {}
+</script>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/markdown-it.min.js"></script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="bar">
+  <button id="back" class="icon" aria-label="Back" hidden>‹</button>
+  <img class="mark" src="icons/mark-white.png" alt="" aria-hidden="true">
+  <h1 id="title">Periodicity</h1>
+  <button id="sync" class="sync" aria-label="Sync now"><span id="sync-dot" class="dot"></span><span id="sync-text"></span></button>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+<main id="view" tabindex="-1"></main>
+
+<form id="composer" class="composer" hidden autocomplete="off">
+  <select id="log-type" aria-label="Log type">
+    <option>UPDATE</option><option>NOTE</option><option>DECISION</option><option>FIX</option><option>BUG</option>
+  </select>
+  <input id="log-text" enterkeyhint="send" placeholder="Log an entry…" aria-label="Log entry">
+  <button class="send" aria-label="Add log entry">↑</button>
+</form>
+
+<nav class="tabs">
+  <a href="#home" data-tab="home"><span class="ti">◉</span>Home</a>
+  <a href="#today" data-tab="today"><span class="ti">☑</span>Today</a>
+  <a href="#tree" data-tab="tree"><span class="ti">☰</span>Tree</a>
+  <a href="#search" data-tab="search"><span class="ti">⌕</span>Search</a>
+  <a href="#settings" data-tab="settings"><span class="ti">⚙</span>Settings</a>
+</nav>
+
+<dialog id="sheet" class="sheet"><form method="dialog" id="sheet-form" autocomplete="off"></form></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
