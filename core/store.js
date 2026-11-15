@@ -185,6 +185,21 @@ export class Store {
     return result;
   }
 
+  /** Replace a one-file branch (no history kept: an orphan commit, force-moved).
+   *  Used for the app's status report, so main never sees it. */
+  async writeSideBranch(branch, path, text, message) {
+    const b = await this.api("POST", `${this.base}/git/blobs`, { content: toBase64(enc.encode(text)), encoding: "base64" });
+    const tree = await this.api("POST", `${this.base}/git/trees`, { tree: [{ path, mode: "100644", type: "blob", sha: b.sha }] });
+    const commit = await this.api("POST", `${this.base}/git/commits`, { message, tree: tree.sha, parents: [] });
+    try {
+      await this.api("PATCH", `${this.base}/git/refs/heads/${branch}`, { sha: commit.sha, force: true });
+    } catch (e) {
+      if (e.status !== 404 && e.status !== 422) throw e;
+      await this.api("POST", `${this.base}/git/refs`, { ref: `refs/heads/${branch}`, sha: commit.sha });
+    }
+    return commit.sha;
+  }
+
   snapshot() {
     return { issues: this.issues, paths: [...this.tree.keys()], knownNames: this.knownNames,
       config: this.config, configText: this.configText };

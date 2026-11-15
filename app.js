@@ -9,10 +9,12 @@ import * as iss from "./core/issue.js";
 import { render, renderInline, esc } from "./core/render.js";
 import { iso, hhmm } from "./core/time.js";
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 const OPS = { addLog: ops.addLog, addAction: ops.addAction, tick: ops.tick, update: ops.update,
   create: ops.create, journalAdd: ops.journalAdd, registerPhone: ops.registerPhone };
 const SYNC_EVERY = 10 * 60 * 1000;
+const STATUS_BRANCH = "status/iphone";
+const REPORT_EVERY = 10 * 60 * 1000;
 
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -79,9 +81,41 @@ async function sync({ quiet = false } = {}) {
       if (!store.head) route();
     } finally {
       syncing = null;
+      report();
     }
   })();
   return syncing;
+}
+
+/** What the app is doing, for Claude to read from the status/iphone branch.
+ *  No token, no key, no issue titles or text: ids and counts only. */
+let lastReport = { at: 0, digest: "" };
+async function report() {
+  if (!store) return;
+  const issues = store.issues ? [...store.issues.values()] : [];
+  let prefix = null;
+  try { if (store.head) prefix = ops.prefix(snap()); } catch {}
+  const status = {
+    app: VERSION,
+    at: iso(),
+    device: navigator.userAgent,
+    installed: matchMedia("(display-mode: standalone)").matches || navigator.standalone === true,
+    online: navigator.onLine,
+    repo: `${settings.owner}/${settings.repo}`,
+    key: Boolean(settings.key),
+    sync: { state: syncState, error: syncError || null, last: lastSync ? iso(lastSync) : null, head: store.head },
+    issues: { total: issues.length, private: issues.filter((i) => i.private).length, locked: issues.filter((i) => i.locked).length },
+    problems: (store.problems || []).length,
+    prefix,
+    waiting: queue.map((q) => ({ op: q.op, id: q.args.id || null })),
+    failed: failed.map((f) => ({ op: f.op, id: f.args.id || null })),
+  };
+  const digest = JSON.stringify({ ...status, at: 0, online: 0 });
+  if (digest === lastReport.digest && Date.now() - lastReport.at < REPORT_EVERY) return;
+  try {
+    await store.writeSideBranch(STATUS_BRANCH, "status.json", JSON.stringify(status, null, 2) + "\n", `iphone status ${status.at}`);
+    lastReport = { at: Date.now(), digest };
+  } catch { /* no access or offline: the missing report is itself the signal */ }
 }
 
 /** Send queued edits, oldest first. Stops at the first network failure. */
@@ -521,7 +555,8 @@ function screenSettings(view) {
     <div class="btns"><button class="btn ghost" id="sync-now">Sync now</button><button class="btn quiet" id="reset">Clear local data</button></div>
   </div>
   <div class="card"><h2>Appearance</h2><select id="theme">${["dark", "light", "auto"].map((t) => `<option${settings.theme === t ? " selected" : ""}>${t}</option>`).join("")}</select></div>
-  <p class="small faint">Periodicity mobile ${VERSION}. The token and key stay on this phone; edits go straight to GitHub as commits on ${esc(settings.branch)}.</p>`;
+  <p class="small faint">Periodicity mobile ${VERSION}. The token and key stay on this phone; edits go straight to GitHub as commits on ${esc(settings.branch)}.
+    After each sync it also writes a status report (version, sync state, counts — no issue text) to the <code>${STATUS_BRANCH}</code> branch.</p>`;
 
   $("#gh").onsubmit = async (e) => {
     e.preventDefault();

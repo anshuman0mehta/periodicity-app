@@ -2,7 +2,7 @@
 // in the background. GitHub API calls are never cached here (the store keeps
 // its own immutable blob cache in IndexedDB).
 
-const CACHE = "periodicity-v2";
+const CACHE = "periodicity-v3";
 const SHELL = [
   "./", "index.html", "style.css", "app.js", "manifest.webmanifest",
   "core/store.js", "core/issue.js", "core/ops.js", "core/views.js", "core/render.js", "core/gitcrypt.js",
