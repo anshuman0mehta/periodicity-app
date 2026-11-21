@@ -7,11 +7,13 @@ import * as ops from "./core/ops.js";
 import * as views from "./core/views.js";
 import * as iss from "./core/issue.js";
 import { render, renderInline, esc } from "./core/render.js";
-import { iso, hhmm } from "./core/time.js";
+import { iso, hhmm, todayDate } from "./core/time.js";
+import * as tables from "./core/tables.js";
 
-const VERSION = "0.1.2";
+const VERSION = "0.4.0";
 const OPS = { addLog: ops.addLog, addAction: ops.addAction, tick: ops.tick, update: ops.update,
-  create: ops.create, journalAdd: ops.journalAdd, registerPhone: ops.registerPhone };
+  create: ops.create, journalAdd: ops.journalAdd, registerPhone: ops.registerPhone,
+  editAction: ops.editAction, editRow: ops.editRow };
 const SYNC_EVERY = 10 * 60 * 1000;
 const STATUS_BRANCH = "status/iphone";
 const REPORT_EVERY = 10 * 60 * 1000;
@@ -28,7 +30,7 @@ let settings = { owner: "anshuman0mehta", repo: "periodicity-data", branch: "mai
   ...load("p:settings", {}) };
 let queue = load("p:queue", []);          // [{op, args}] waiting for the network, in order
 let failed = load("p:failed", []);        // [{op, args, error}] that could not be applied
-const ui = load("p:ui", { open: {}, hideDone: true, logOpen: false });
+const ui = { minPriority: "any", ...load("p:ui", { open: {}, hideDone: true, logOpen: false }) };
 const saveUi = () => keep("p:ui", ui);
 
 let store = null;
@@ -190,7 +192,8 @@ function banner() {
 function describe(q) {
   const a = q.args;
   return { addLog: `log on ${a.id}: ${a.text}`, addAction: `action on ${a.id}: ${a.text}`, tick: `tick on ${a.id}: ${a.label}`,
-    update: `edit of ${a.id}`, create: `new issue “${a.title}”`, journalAdd: `journal: ${a.text}`, registerPhone: "register phone" }[q.op] || q.op;
+    update: `edit of ${a.id}`, create: `new issue “${a.title}”`, journalAdd: `journal: ${a.text}`, registerPhone: "register phone",
+    editAction: `action on ${a.id}: ${a.label}`, editRow: `table row on ${a.id}` }[q.op] || q.op;
 }
 
 let toastTimer;
@@ -220,10 +223,29 @@ function composer(on) {
 const snap = () => store.snapshot();
 const titles = () => new Map([...store.issues.values()].map((i) => [i.id, i.title]));
 
+const PRIO_LABEL = { urgent: "Urgent", high: "High", medium: "Med", low: "Low" };
+
+/** A small priority chip; nothing for "none". */
+function prioBadge(i) {
+  const p = i.meta.priority;
+  return PRIO_LABEL[p] ? `<span class="prio p-${p}" title="${p} priority">${PRIO_LABEL[p]}</span>` : "";
+}
+
+/** The "Priority" filter shared by Today and Tree: minimum level shown. */
+function prioFilter() {
+  const o = (v, label) => `<option value="${v}"${ui.minPriority === v ? " selected" : ""}>${label}</option>`;
+  return `<select id="min-priority" class="prio-filter" aria-label="Minimum priority">` +
+    o("any", "All priorities") + o("urgent", "Urgent only") + o("high", "High and up") +
+    o("medium", "Medium and up") + o("low", "Low and up") + `</select>`;
+}
+function bindPrioFilter(rerender) {
+  $("#min-priority").onchange = (e) => { ui.minPriority = e.target.value; saveUi(); rerender(); };
+}
+
 function issueLink(i, extra = "") {
   const pend = i.pending ? ` <span class="pending-mark">●</span>` : "";
   return `<a class="item" href="#${esc(i.id)}"><span class="t${i.private ? " lock" : ""}">${esc(i.title)}${pend}</span>` +
-    `${extra}<span class="id">${esc(i.id)}</span></a>`;
+    `${prioBadge(i)}${extra}<span class="id">${esc(i.id)}</span></a>`;
 }
 
 function statusPill(i) {
@@ -252,6 +274,102 @@ function needStore(view) {
   return false;
 }
 
+// ---------------------------------------------------------------- actions: 📅 due · 💤 snooze · — Owner
+
+const shortDate = (d) => new Date(`${d}T00:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+const addDays = (n) => { const t = new Date(`${todayDate()}T00:00:00Z`); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10); };
+const nextMonday = () => { const t = new Date(`${todayDate()}T00:00:00Z`); t.setUTCDate(t.getUTCDate() + (((8 - t.getUTCDay()) % 7) || 7)); return t.toISOString().slice(0, 10); };
+
+function chips(it, { owners = true } = {}) {
+  let h = "";
+  if (it.due) h += `<span class="pill${it.days < 0 ? " warn" : it.days <= 3 ? " accent" : ""}">` +
+    `${it.days < 0 ? `${-it.days}d late` : it.days === 0 ? "today" : it.days === 1 ? "tomorrow" : shortDate(it.due)}</span>`;
+  if (it.snoozed) h += `<span class="pill snz">💤 ${shortDate(it.snooze)}</span>`;
+  if (it.waiting) h += `<span class="pill wait${it.waited >= 7 ? " warn" : ""}">⏳ ${it.waited}d</span>`;
+  if (owners) for (const o of it.owners || []) h += `<span class="pill own">${esc(o)}</span>`;
+  return h ? ` <span class="chips">${h}</span>` : "";
+}
+
+/** A tickable action row (Today, Focus, Home), with a ⋯ for date/snooze/owner. */
+function actionRow(issue, it, where = "") {
+  return `<div class="t-item${it.warn ? " warn" : ""}${it.snoozed ? " snoozed" : ""}">` +
+    `<input type="checkbox" data-id="${esc(issue.id)}" data-n="${it.n}" aria-label="Done">` +
+    `<span class="x">${renderInline(it.core, titles())}${chips(it)}${where}</span>` +
+    `<button class="more" data-id="${esc(issue.id)}" data-n="${it.n}" aria-label="Due, snooze, owner">⋯</button></div>`;
+}
+
+/** Tick and ⋯ for every action row in a view. */
+function wireActions(view) {
+  view.onchange = async (e) => {
+    const box = e.target;
+    if (!box.matches(".t-item input[type=checkbox][data-n]")) return;
+    const issue = store.issues.get(box.dataset.id);
+    const a = iss.actionAt(issue.body, Number(box.dataset.n));
+    box.disabled = true;
+    try {
+      await act("tick", { id: issue.id, label: a.label, occurrence: a.occurrence, done: true }, { quiet: true });
+      box.closest(".t-item").style.opacity = ".35";
+      toast("Ticked");
+    } catch { box.checked = false; box.disabled = false; }
+  };
+  view.onclick = (e) => {
+    const b = e.target.closest("button.more");
+    if (!b) return;
+    e.preventDefault();
+    metaSheet(store.issues.get(b.dataset.id), Number(b.dataset.n));
+  };
+}
+
+function knownOwners() {
+  const set = new Set(["Anshuman", "Ishika"]);
+  for (const i of store.issues.values()) {
+    if (i.locked) continue;
+    for (const it of views.actionItems(i)) it.owners.forEach((o) => set.add(o));
+  }
+  return [...set].sort();
+}
+
+/** Every checkbox in the body with its metadata, whatever section it is in. */
+function allItems(issue) {
+  const body = "## Actions\n" + issue.body.split("\n").map((l) => (l.startsWith("## ") ? "## Actions" : l)).join("\n");
+  return views.actionItems({ body }, undefined, { includeDone: true });
+}
+
+function metaSheet(issue, n) {
+  const it = allItems(issue).find((x) => x.n === n);
+  if (!it) return;
+  const a = iss.actionAt(issue.body, n);
+  const quick = (name, list) => list.map(([v, l]) => `<button type="button" class="btn quiet" data-${name}="${v}">${l}</button>`).join("");
+  sheet(`<h3>${renderInline(it.core, titles())}</h3>` +
+    `<label>Due<input type="date" name="due" value="${esc(it.due || "")}"></label>` +
+    `<div class="quick">${quick("due", [[addDays(0), "Today"], [addDays(1), "Tomorrow"], [addDays(7), "+1 week"], ["", "Clear"]])}</div>` +
+    `<label>Snooze until<input type="date" name="snooze" value="${esc(it.snooze || "")}"></label>` +
+    `<div class="quick">${quick("snooze", [[addDays(1), "Tomorrow"], [addDays(3), "3 days"], [nextMonday(), "Monday"], ["", "Wake"]])}</div>` +
+    `<label class="inline"><input type="checkbox" name="waiting"${it.waiting ? " checked" : ""}> Waiting on someone else` +
+    `${it.waiting ? ` (since ${shortDate(it.waiting)})` : ""}</label>` +
+    `<label>Owner<input name="owners" list="owner-list" value="${esc(it.owners.join(" & "))}" placeholder="Anshuman & Ishika"></label>` +
+    `<datalist id="owner-list">${knownOwners().map((o) => `<option value="${esc(o)}">`).join("")}</datalist>` +
+    `<p class="small muted">Saved into the line as 📅 · 💤 · — Owner. A snoozed action leaves Today and Home until its day.</p>`,
+    (f) => {
+      const owners = f.owners.value.split(/\s*(?:&|,|\band\b)\s*/).map((s) => s.trim()).filter(Boolean)
+        .map((s) => s[0].toUpperCase() + s.slice(1));
+      const changes = {};
+      if ((f.due.value || null) !== it.due) changes.due = f.due.value || null;
+      if ((f.snooze.value || null) !== it.snooze) changes.snooze = f.snooze.value || null;
+      if (owners.join("&") !== it.owners.join("&")) changes.owners = owners;
+      if (f.waiting.checked !== Boolean(it.waiting)) changes.waiting = f.waiting.checked ? todayDate() : null;
+      if (!Object.keys(changes).length) return Promise.resolve();
+      return act("editAction", { id: issue.id, label: a.label, occurrence: a.occurrence, ...changes });
+    });
+  $("#sheet-form").onclick = (e) => {
+    const b = e.target.closest("button[data-due], button[data-snooze]");
+    if (!b) return;
+    const f = $("#sheet-form");
+    if (b.dataset.due !== undefined) f.due.value = b.dataset.due;
+    else f.snooze.value = b.dataset.snooze;
+  };
+}
+
 // ---------------------------------------------------------------- screens
 
 function screenHome(view) {
@@ -278,15 +396,48 @@ function screenHome(view) {
 
   const block = (title, items, extra) => items.length
     ? `<section class="card"><h2>${title}</h2><ul class="list">${items.map((x) => `<li>${extra(x)}</li>`).join("")}</ul></section>` : "";
+  if (h.countdowns.length) {
+    html += `<div class="cds">${h.countdowns.map((c) => {
+      const pct = c.total ? Math.round((100 * c.done) / c.total) : 0;
+      return `<a class="cd" href="#${esc(c.issue.id)}/focus"><b>${c.days < 0 ? -c.days : c.days}</b>` +
+        `<span>${c.days < 0 ? "days ago" : c.days === 1 ? "day to go" : "days to go"}</span>` +
+        `<div class="cd-t">${esc(c.issue.title)}</div><div class="small muted">${c.open} open${c.overdue ? ` · ${c.overdue} overdue` : ""} · ${pct}%</div>` +
+        `<div class="progress"><i style="width:${pct}%"></i></div></a>`;
+    }).join("")}</div>`;
+  }
+  const weekItems = h.week.reduce((n, d) => n + d.items.length, 0);
+  if (weekItems) {
+    html += `<section class="card"><h2>The week ahead</h2>` + h.week.filter((d) => d.items.length).map((d) =>
+      `<div class="wk-h${d.label === "Overdue" ? " over" : ""}">${esc(d.label)}</div>` + d.items.map((it) => it.kind === "action"
+        ? actionRow(it.issue, it, ` <a class="where" href="#${esc(it.issue.id)}">${esc(it.issue.title)}</a>`)
+        : it.kind === "event"
+          ? `<div class="wk-ev">◆ ${renderInline(it.text, titles())} <a class="where" href="#${esc(it.issue.id)}">${esc(it.issue.title)}</a></div>`
+          : `<div class="wk-ev">■ <a href="#${esc(it.issue.id)}"><b>${esc(it.issue.title)}</b></a> <span class="muted small">due</span></div>`).join("")).join("") +
+      `</section>`;
+  }
+  for (const t of h.tiles) {
+    html += `<section class="card"><h2><a href="#${esc(t.issue.id)}" style="color:inherit">${esc(t.issue.title)}</a></h2><div class="md">${render(t.text, titles())}</div></section>`;
+  }
+  if (h.waiting.length) {
+    html += `<section class="card"><h2>Waiting on others</h2>` +
+      h.waiting.map((w) => actionRow(w.issue, w, ` <a class="where" href="#${esc(w.issue.id)}">${esc(w.issue.title)}</a>`)).join("") + `</section>`;
+  }
+  if (h.dueActions.length && !weekItems) {
+    html += `<section class="card"><h2>Actions due · next 2 weeks</h2>` +
+      h.dueActions.map((a) => actionRow(a.issue, a, ` <a class="where" href="#${esc(a.issue.id)}">${esc(a.issue.title)}</a>`)).join("") + `</section>`;
+  }
   html += block("Due", h.upcoming, (u) => issueLink(u.issue, ` <span class="pill${u.days < 0 ? " warn" : u.days <= 3 ? " accent" : ""}">` +
     `${u.days < 0 ? `${-u.days}d late` : u.days === 0 ? "today" : `${u.days}d`}</span>`));
+  html += block("Urgent &amp; high", h.priority, (i) => issueLink(i, i.meta.due ? ` <span class="pill">${esc(String(i.meta.due).slice(5).split("-").reverse().join("-"))}</span>` : ""));
   html += block("Pinned", h.pinned, (i) => issueLink(i));
   html += block("In progress", h.inProgress, (i) => issueLink(i));
   html += block("Recently changed", h.recent, (i) => issueLink(i));
+  html += block("Not touched in two weeks", h.neglected, (n) => issueLink(n.issue, ` <span class="pill">${n.open} open · ${n.idle}d</span>`));
   html += `<section><div class="section-title">Areas</div><div class="areas">` + h.areas.map((a) =>
-    `<a class="area" href="#${esc(a.issue.id)}"><b class="${a.issue.private ? "lock" : ""}">${esc(a.issue.title)}</b>` +
+    `<a class="area" href="#${esc(a.issue.id)}/focus"><b class="${a.issue.private ? "lock" : ""}">${esc(a.issue.title)}</b>` +
     `<div class="n">${a.open} open${a.warn ? ` · <span style="color:var(--coral)">${a.warn} ⚠</span>` : ""} · ${a.issues} issues</div></a>`).join("") + `</div></section>`;
   view.innerHTML = html;
+  wireActions(view);
 
   $("#journal-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -302,25 +453,72 @@ function screenHome(view) {
 function screenToday(view) {
   setTitle("Today"); setTab("today");
   if (!needStore(view)) return;
-  const groups = views.today(snap());
-  if (!groups.length) { view.innerHTML = `<p class="empty">No open actions. 🎉</p>`; return; }
+  const all = views.today(snap());
+  const groups = all.map((g) => ({ ...g, issues: g.issues.filter(({ issue }) => views.atLeast(issue, ui.minPriority)) }))
+    .filter((g) => g.issues.length);
+  const head = `<div class="filters">${prioFilter()}<span class="grow"></span></div>`;
+  if (!groups.length) {
+    view.innerHTML = head + `<p class="empty">${all.length ? "No open actions at this priority." : "No open actions. 🎉"}</p>`;
+    bindPrioFilter(() => screenToday(view));
+    return;
+  }
   const t = titles();
-  view.innerHTML = groups.map((g) => `<section class="t-group"><div class="section-title">${esc(g.areaTitle)}</div>` +
-    g.issues.map(({ issue, items }) => `<div class="card"><a class="t-issue" href="#${esc(issue.id)}">${esc(issue.title)} <span class="id">${esc(issue.id)}</span></a>` +
-      items.map((it) => `<label class="t-item${it.warn ? " warn" : ""}"><input type="checkbox" data-id="${esc(issue.id)}" data-n="${it.n}">` +
-        `<span class="x">${renderInline(it.text, t)}</span></label>`).join("") + `</div>`).join("") + `</section>`).join("");
-  view.onchange = async (e) => {
-    const box = e.target;
-    if (!box.matches("input[type=checkbox][data-n]")) return;
-    const issue = store.issues.get(box.dataset.id);
-    const a = iss.actionAt(issue.body, Number(box.dataset.n));
-    box.disabled = true;
-    try {
-      await act("tick", { id: issue.id, label: a.label, occurrence: a.occurrence, done: true }, { quiet: true });
-      box.closest(".t-item").style.opacity = ".35";
-      toast("Ticked");
-    } catch { box.checked = false; box.disabled = false; }
+  view.innerHTML = head + groups.map((g) => `<section class="t-group"><a class="section-title" href="#${esc(g.area)}/focus">${esc(g.areaTitle)} ›</a>` +
+    g.issues.map(({ issue, items }) => `<div class="card"><a class="t-issue" href="#${esc(issue.id)}">${esc(issue.title)} ${prioBadge(issue)}<span class="id">${esc(issue.id)}</span></a>` +
+      items.map((it) => actionRow(issue, it)).join("") + `</div>`).join("") + `</section>`).join("");
+  wireActions(view);
+  bindPrioFilter(() => screenToday(view));
+}
+
+// ---------------------------------------------------------------- focus: one project
+
+function screenFocus(view, id) {
+  setTab("");
+  if (!needStore(view)) return;
+  const f = views.focus(snap(), id.toUpperCase());
+  if (!f) { setTitle(id, true); view.innerHTML = `<p class="empty">No issue ${esc(id)}.</p>`; return; }
+  setTitle("Focus", true);
+  const p = ui.focus || (ui.focus = { owner: "", only: "", snoozed: false });
+  const t = f.totals;
+  const pct = t.total ? Math.round((100 * t.done) / t.total) : 0;
+  const keepIt = (it) => (p.snoozed || !it.snoozed)
+    && (!p.owner || (p.owner === "(no owner)" ? !it.owners.length : it.owners.includes(p.owner)))
+    && (p.only !== "flagged" || it.flag) && (p.only !== "overdue" || (it.days !== null && it.days < 0))
+    && (p.only !== "week" || (it.days !== null && it.days >= 0 && it.days <= 7));
+  const stat = (key, n, label) => `<button class="stat${p.only === key ? " on" : ""}${key && key !== "week" && n ? " warn" : ""}" data-only="${key}"><b>${n}</b><span>${label}</span></button>`;
+  let html = `<h2 class="issue-title"><a href="#${esc(f.issue.id)}">${esc(f.issue.title)}</a></h2>` +
+    `<p class="small muted">${t.done} of ${t.total} actions done · ${t.issues} issues` +
+    `${f.days !== null ? ` · ${f.days < 0 ? `${-f.days} days past` : `${f.days} days to go`}` : ""}</p>` +
+    `<div class="progress"><i style="width:${pct}%"></i></div>` +
+    `<div class="stats">${stat("", t.open, "open")}${stat("flagged", t.flagged, "flagged")}${stat("overdue", t.overdue, "overdue")}${stat("week", t.dueWeek, "this week")}</div>` +
+    `<div class="f-tools"><select id="f-owner"><option value="">Everyone</option>${f.owners.map(([o, n]) =>
+      `<option value="${esc(o)}"${p.owner === o ? " selected" : ""}>${esc(o)} · ${n}</option>`).join("")}</select>` +
+    `<label class="inline"><input type="checkbox" id="f-snz"${p.snoozed ? " checked" : ""}> Snoozed (${t.snoozed})</label></div>`;
+  let shown = 0, clear = 0;
+  for (const g of f.groups) {
+    const items = g.items.filter(keepIt);
+    if (!items.length) { if (g.total && !g.items.length) clear++; continue; }
+    shown += items.length;
+    html += `<div class="card f-card" style="margin-left:${Math.min(g.depth, 3) * 10}px"><a class="t-issue" href="#${esc(g.issue.id)}">${esc(g.issue.title)}` +
+      ` <span class="id">${g.done}/${g.total}</span></a>${items.map((it) => actionRow(g.issue, it)).join("")}</div>`;
+  }
+  if (!shown) html += `<p class="empty">Nothing matches.</p>`;
+  if (clear) html += `<p class="small faint">✓ ${clear} sub-issue${clear > 1 ? "s" : ""} with every action done.</p>`;
+  const money = views.money(snap(), f.issue.id);
+  if (money.length) {
+    html += `<section class="card"><h2>Money in tables · ${tables.rupees(money.reduce((s, m) => s + m.total, 0))}</h2><ul class="list">` +
+      money.map((m) => `<li>${issueLink(m.issue, ` <span class="pill">${esc(m.column)} ${esc(m.shown)}</span>`)}</li>`).join("") + `</ul></section>`;
+  }
+  view.innerHTML = html;
+  wireActions(view);
+  const click = view.onclick;
+  view.onclick = (e) => {
+    const s = e.target.closest("[data-only]");
+    if (s) { p.only = p.only === s.dataset.only ? "" : s.dataset.only; saveUi(); route(); return; }
+    click(e);
   };
+  $("#f-owner").onchange = (e) => { p.owner = e.target.value; saveUi(); route(); };
+  $("#f-snz").onchange = (e) => { e.stopPropagation(); p.snoozed = e.target.checked; saveUi(); route(); };
 }
 
 function screenTree(view) {
@@ -328,19 +526,30 @@ function screenTree(view) {
   if (!needStore(view)) return;
   const s = snap();
   const hidden = (i) => ui.hideDone && (i.status === "done" || i.status === "cancelled");
+  // with a priority filter, keep an issue if it or anything under it qualifies, and open the path to it
+  const filtering = ui.minPriority && ui.minPriority !== "any";
+  const memo = new Map();
+  const keep = (i) => {
+    if (memo.has(i.id)) return memo.get(i.id);
+    memo.set(i.id, false);                                  // guards against parent cycles
+    const ok = !hidden(i) && (views.atLeast(i, ui.minPriority) || views.children(s, i.id).some(keep));
+    memo.set(i.id, ok);
+    return ok;
+  };
   const node = (i, depth) => {
-    const kids = views.children(s, i.id).filter((k) => !hidden(k));
-    const open = ui.open[i.id] ?? depth < 1;
+    const kids = views.children(s, i.id).filter(keep);
+    const open = filtering ? true : ui.open[i.id] ?? depth < 1;
     const n = i.openActions();
     return `<li><div class="node${i.status === "done" ? " done" : ""}">` +
       (kids.length ? `<button class="tw" data-tw="${esc(i.id)}" aria-label="${open ? "Collapse" : "Expand"}">${open ? "▾" : "▸"}</button>` : `<span class="tw"></span>`) +
-      `<a href="#${esc(i.id)}" class="${i.private ? "lock" : ""}">${esc(i.title)}</a>${n ? `<span class="cnt">${n}</span>` : ""}</div>` +
+      `<a href="#${esc(i.id)}" class="${i.private ? "lock" : ""}${filtering && !views.atLeast(i, ui.minPriority) ? " dim" : ""}">${esc(i.title)}</a>` +
+      `${prioBadge(i)}${n ? `<span class="cnt">${n}</span>` : ""}</div>` +
       (kids.length && open ? `<ul>${kids.map((k) => node(k, depth + 1)).join("")}</ul>` : "") + `</li>`;
   };
-  const roots = views.roots(s).filter((i) => !i.locked && !hidden(i));
+  const roots = views.roots(s).filter((i) => !i.locked && keep(i));
   const locked = [...s.issues.values()].filter((i) => i.locked && i.status !== "archived");
   view.innerHTML = `<div class="filters"><label><input type="checkbox" id="hide-done"${ui.hideDone ? " checked" : ""}> Hide done</label>` +
-    `<span class="grow"></span><button class="btn ghost" id="new-root">+ New issue</button></div>` +
+    prioFilter() + `<span class="grow"></span><button class="btn ghost" id="new-root">+ New issue</button></div>` +
     `<ul class="tree">${roots.map((r) => node(r, 0)).join("")}</ul>` +
     (locked.length ? `<div class="card" style="margin-top:14px"><h2>Encrypted (${locked.length})</h2><p class="small muted">` +
       `Add the git-crypt key in Settings to read these and place them in the tree.</p><ul class="list">${locked.map((i) => `<li>${issueLink(i)}</li>`).join("")}</ul></div>` : "");
@@ -352,6 +561,7 @@ function screenTree(view) {
     screenTree(view);
   };
   $("#hide-done").onchange = (e) => { ui.hideDone = e.target.checked; saveUi(); screenTree(view); };
+  bindPrioFilter(() => screenTree(view));
   $("#new-root").onclick = () => newIssueSheet(null);
 }
 
@@ -393,6 +603,7 @@ function screenIssue(view, id) {
   const done = boxes.filter((l) => iss.CHECKBOX.exec(l)[2] !== " ").length;
 
   // render the whole body once so checkbox numbering matches the file
+  const labs = (issue.meta.labels || []).map((l) => String(l).toLowerCase());
   const opts = (list, cur) => list.map((x) => `<option${x === cur ? " selected" : ""}>${x}</option>`).join("");
   let html = crumbs.length ? `<div class="crumbs">${crumbs.map((c) => `<a href="#${esc(c.id)}">${esc(c.title)}</a>`).join(" › ")}</div>` : "";
   html += `<h2 class="issue-title${issue.private ? " lock" : ""}" id="rename">${esc(issue.title)}${issue.pending ? ` <span class="pending-mark">● waiting to sync</span>` : ""}</h2>`;
@@ -401,28 +612,56 @@ function screenIssue(view, id) {
       : `<select id="f-status" aria-label="Status">${opts(iss.STATUSES.filter((x) => x !== "archived"), issue.status)}</select>`) +
     `<select id="f-priority" aria-label="Priority">${opts(iss.PRIORITIES, issue.meta.priority || "none")}</select>` +
     `<input id="f-due" type="date" aria-label="Due" value="${esc(issue.meta.due || "")}">` +
-    `<button class="pin${issue.meta.pinned ? " on" : ""}" id="f-pin">${issue.meta.pinned ? "★ Pinned" : "☆ Pin"}</button></div>`;
+    `<button class="pin${issue.meta.pinned ? " on" : ""}" id="f-pin">${issue.meta.pinned ? "★ Pinned" : "☆ Pin"}</button>` +
+    `<button class="pin${labs.includes("countdown") ? " on" : ""}" id="f-cd">⏱ Countdown</button>` +
+    `<button class="pin${labs.includes("calendar") ? " on" : ""}" id="f-cal">▦ Calendar</button></div>`;
   if (boxes.length) html += `<div class="progress" title="${done}/${boxes.length} actions done"><i style="width:${(100 * done / boxes.length).toFixed(1)}%"></i></div>`;
   const rendered = render(issue.body, t);
   html += `<div class="md" id="body">${rendered}</div>`;
   html += `<div class="btns"><button class="btn ghost" id="add-action">+ Action</button><button class="btn ghost" id="new-child">+ Child issue</button>` +
-    `<button class="btn quiet" id="edit">Edit text</button></div>`;
+    `<button class="btn quiet" id="edit">Edit text</button>` +
+    `${kids.length || boxes.length ? `<a class="btn quiet" href="#${esc(issue.id)}/focus">Focus</a>` : ""}</div>`;
   if (kids.length) html += `<section class="card" style="margin-top:16px"><h2>Children</h2><ul class="list">${kids.map((k) => `<li>${issueLink(k, statusPill(k))}</li>`).join("")}</ul></section>`;
   if (back.length) html += `<section class="card"><h2>Linked from</h2><ul class="list">${back.map((b) => `<li>${issueLink(store.issues.get(b.from), `<span class="pill">${esc(b.type)}</span>`)}</li>`).join("")}</ul></section>`;
   html += `<p class="small faint">Updated ${esc((issue.meta.updated || "").replace("T", " ").slice(0, 16))} · created ${esc((issue.meta.created || "").slice(0, 10))}` +
     `${issue.meta.legacy?.length ? ` · was ${esc(issue.meta.legacy.join(", "))}` : ""}</p>`;
   view.innerHTML = html;
   foldLog($("#body"));
+  decorateBody($("#body"), issue);
+  enhanceTables($("#body"), issue);
 
   const set = async (fields) => { try { await act("update", { id: issue.id, fields }, { quiet: true }); toast("Saved"); } catch {} route(); };
   $("#f-status") && ($("#f-status").onchange = (e) => set({ status: e.target.value }));
   $("#f-priority").onchange = (e) => set({ priority: e.target.value });
   $("#f-due").onchange = (e) => set({ due: e.target.value || null });
   $("#f-pin").onclick = () => set({ pinned: !issue.meta.pinned });
+  const toggleLabel = (name) => {
+    const list = (issue.meta.labels || []).map(String);
+    const has = list.some((l) => l.toLowerCase() === name);
+    if (!has && name === "countdown" && !issue.meta.due) { toast("Set a due date first — the countdown runs to it", true); return; }
+    set({ labels: has ? list.filter((l) => l.toLowerCase() !== name) : [...list, name] });
+  };
+  $("#f-cd").onclick = () => toggleLabel("countdown");
+  $("#f-cal").onclick = () => toggleLabel("calendar");
   $("#rename").onclick = () => renameSheet(issue);
   $("#add-action").onclick = () => actionSheet(issue);
   $("#new-child").onclick = () => newIssueSheet(issue);
   $("#edit").onclick = () => editSheet(issue);
+  $("#body").onclick = (e) => {
+    const more = e.target.closest("button.more");
+    if (more) { e.preventDefault(); metaSheet(issue, Number(more.dataset.n)); return; }
+    const th = e.target.closest(".tbl th");
+    if (th) { sortTable(th); return; }
+    const add = e.target.closest(".tbl-add");
+    if (add) { rowSheet(issue, Number(add.dataset.k), null); return; }
+    const tr = e.target.closest(".tbl tbody tr");
+    if (tr && !e.target.closest("a")) rowSheet(issue, Number(tr.closest(".tbl").dataset.k), tr.dataset.row);
+  };
+  $("#body").oninput = (e) => {
+    if (!e.target.matches(".tbl-q")) return;
+    const q = e.target.value.toLowerCase();
+    $$("tbody tr", e.target.closest(".tbl")).forEach((tr) => { tr.hidden = !!q && !tr.textContent.toLowerCase().includes(q); });
+  };
   $("#body").onchange = async (e) => {
     if (!e.target.classList.contains("tick")) return;
     const box = e.target;
@@ -445,6 +684,84 @@ function screenIssue(view, id) {
       route();
     } catch {}
   };
+}
+
+const META_TOKEN = /\s*(📅|💤|⏳)\s*\d{4}-\d{2}-\d{2}/g;
+
+/** Body actions: hide the raw 📅/💤 tokens, show chips and a ⋯ button. */
+function decorateBody(root, issue) {
+  const meta = new Map(allItems(issue).map((x) => [x.n, x]));
+  for (const box of $$("input.tick", root)) {
+    const it = meta.get(Number(box.dataset.n));
+    const li = box.closest("li");
+    if (!it || !li) continue;
+    const walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentElement.closest("ul,ol") === li.parentElement ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT) });
+    const texts = [];
+    while (walker.nextNode()) texts.push(walker.currentNode);
+    for (const t of texts) if (/[📅💤⏳]/u.test(t.nodeValue)) t.nodeValue = t.nodeValue.replace(META_TOKEN, "");
+    const holder = document.createElement("span");
+    holder.innerHTML = (it.done ? "" : chips(it, { owners: false })) +
+      (issue.status === "archived" ? "" : ` <button class="more" data-n="${it.n}" aria-label="Due, snooze, owner">⋯</button>`);
+    const nested = $(":scope > ul, :scope > ol", li);
+    [...holder.childNodes].forEach((n) => li.insertBefore(n, nested));
+  }
+}
+
+/** Tables: tap a heading to sort, filter long ones, tap a row to edit it. */
+function enhanceTables(root, issue) {
+  const src = tables.find(issue.body);
+  $$("table", root).forEach((table, k) => {
+    const t = src[k];
+    const heads = $$("thead th", table);
+    const editable = t && t.header.length === heads.length && issue.status !== "archived";
+    const wrap = document.createElement("div");
+    wrap.className = "tbl";
+    wrap.dataset.k = k;
+    const rows = $$("tbody tr", table);
+    if (editable) rows.forEach((tr, i) => { tr.dataset.row = i; });
+    wrap.innerHTML = `<div class="tbl-bar">${rows.length > 6 ? `<input class="tbl-q" type="search" placeholder="Filter ${rows.length} rows">` : `<span class="small faint">${rows.length} rows</span>`}` +
+      (editable ? `<button type="button" class="btn quiet tbl-add" data-k="${k}">+ Row</button>` : "") + `</div>`;
+    table.replaceWith(wrap);
+    wrap.appendChild(table);
+    if (!editable) wrap.classList.add("ro");
+    const sums = editable ? tables.totals(t.header, t.rows) : {};
+    if (Object.keys(sums).length) {
+      const foot = document.createElement("tfoot");
+      foot.innerHTML = `<tr>${heads.map((_, c) => `<td>${c === 0 ? "Total" : sums[c] !== undefined ? esc(tables.rupees(sums[c])) : ""}</td>`).join("")}</tr>`;
+      table.appendChild(foot);
+    }
+  });
+}
+
+function sortTable(th) {
+  const table = th.closest("table");
+  const heads = $$("thead th", table);
+  const c = heads.indexOf(th);
+  const dir = th.dataset.sort === "asc" ? "desc" : "asc";
+  heads.forEach((h) => delete h.dataset.sort);
+  th.dataset.sort = dir;
+  const key = (tr) => (tr.children[c]?.textContent || "").trim();
+  const num = (s) => { const n = Number(s.replace(/[,₹%\s]/g, "")); return s && !Number.isNaN(n) ? n : null; };
+  const body = $("tbody", table);
+  $$("tr", body).sort((a, b) => {
+    const x = key(a), y = key(b), nx = num(x), ny = num(y);
+    const r = nx !== null && ny !== null ? nx - ny : x.localeCompare(y, undefined, { numeric: true });
+    return dir === "asc" ? r : -r;
+  }).forEach((tr) => body.appendChild(tr));
+}
+
+function rowSheet(issue, k, rowIndex) {
+  const t = tables.find(issue.body)[k];
+  if (!t) return;
+  const before = rowIndex === null || rowIndex === undefined ? null : t.rows[Number(rowIndex)];
+  const unesc = (s) => (s || "").replace(/\\\|/g, "|");
+  sheet(`<h3>${before ? "Edit row" : "New row"} · table ${k + 1}</h3>` +
+    t.header.map((h, c) => `<label>${esc(unesc(h).replace(/\*\*/g, ""))}<textarea name="c${c}" rows="1">${esc(unesc(before ? before[c] : ""))}</textarea></label>`).join("") +
+    (before ? `<label class="inline"><input type="checkbox" name="del"> Delete this row</label>` : "") +
+    `<p class="small muted">Cells are Markdown. Refused if this row changed on another machine.</p>`,
+    (f) => act("editRow", { id: issue.id, k, header: t.header, before,
+      after: before && f.del?.checked ? null : t.header.map((_, c) => f[`c${c}`].value) }));
 }
 
 /** Wrap the rendered `## Log` section (to the next h2) in a <details>. */
@@ -612,6 +929,7 @@ function route() {
   else if (hash === "tree") screenTree(view);
   else if (hash === "search") screenSearch(view);
   else if (hash === "settings") screenSettings(view);
+  else if (hash.endsWith("/focus")) screenFocus(view, hash.slice(0, -"/focus".length));
   else screenIssue(view, hash);
   window.scrollTo(0, scroll);
   banner();

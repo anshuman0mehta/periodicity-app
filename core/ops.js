@@ -11,6 +11,8 @@
 import * as iss from "./issue.js";
 import { iso, monthTitle, dayHeading, hhmm } from "./time.js";
 import { isCryptPath } from "./gitcrypt.js";
+import { withMeta } from "./actions.js";
+import * as tables from "./tables.js";
 
 export const MACHINE = "iphone";
 export const DEFAULT_PREFIX = "P-I-";
@@ -125,6 +127,46 @@ export function tick(snap, { id, label, occurrence = 0, done }) {
   if (n < 0) throw new OpError(`${issue.id} no longer has the action "${label.slice(0, 60)}"`);
   issue.body = iss.setActionLine(issue.body, n, done);
   return { changes: save(issue), message: `${issue.id}: ${done ? "tick" : "untick"} action`, result: issue };
+}
+
+/** Set an action's 📅 due, 💤 snooze or owners. Found by its text, so it
+ *  re-applies cleanly after another machine's push. Only keys present change. */
+export function editAction(snap, { id, label, occurrence = 0, ...meta }) {
+  const issue = get(snap, id);
+  const n = iss.findAction(issue.body, label, occurrence);
+  if (n < 0) throw new OpError(`${issue.id} no longer has the action "${label.slice(0, 60)}"`);
+  const fields = {};
+  for (const k of ["due", "snooze", "owners", "waiting"]) if (k in meta) fields[k] = meta[k];
+  for (const k of ["due", "snooze", "waiting"]) {
+    if (fields[k] && !/^\d{4}-\d{2}-\d{2}$/.test(fields[k])) throw new OpError(`${k} must be a date as YYYY-MM-DD`);
+  }
+  const lines = issue.body.split("\n");
+  let seen = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const m = iss.CHECKBOX.exec(lines[i]);
+    if (m && ++seen === n) { lines[i] = m[1] + m[2] + "] " + oneLine(withMeta(m[3].slice(2), fields)); break; }
+  }
+  issue.body = lines.join("\n");
+  const what = Object.entries(fields).map(([k, v]) => k === "owners" ? `owner ${v && v.length ? v.join(" & ") : "cleared"}`
+    : `${k} ${v || "cleared"}`).join(", ");
+  return { changes: save(issue), message: `${issue.id}: action ${what || "edited"}`, result: issue };
+}
+
+/** Change, add (before = null) or delete (after = null) one row of table k.
+ *  The row is found by its cells, so a queued edit still lands right. */
+export function editRow(snap, { id, k, header, before = null, after = null }) {
+  const issue = get(snap, id);
+  const t = tables.find(issue.body)[k];
+  if (!t || JSON.stringify(t.header) !== JSON.stringify(header)) throw new OpError(`${issue.id}: that table changed; reload it`);
+  const rows = t.rows.map((r) => [...r]);
+  const same = (a, b) => JSON.stringify(a.map((c) => c.trim())) === JSON.stringify(b.map((c) => c.trim()));
+  if (before) {
+    const at = rows.findIndex((r) => same(r, before));
+    if (at < 0) throw new OpError(`${issue.id}: that row changed on another machine; reload it`);
+    if (after) rows[at] = after; else rows.splice(at, 1);
+  } else if (after) rows.push(after);
+  issue.body = tables.replace(issue.body, k, t.header, rows, t.header);
+  return { changes: save(issue), message: `${issue.id}: edit table ${k + 1}`, result: issue };
 }
 
 export function addAction(snap, { id, text }) {
